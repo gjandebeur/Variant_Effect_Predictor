@@ -1,0 +1,651 @@
+#!/usr/bin/env Rscript
+
+# ----------------------- EDIT THESE SETTINGS -----------------------
+
+cfg <- list(
+  shap_dir = "",
+  input_dir = "",
+  context_tsv = "",
+  out_dir = "",
+  head = "counts",
+  left_bp = 15L,
+  right_bp = 10L,
+  variant = c(""),          #### ADD SPECIFIC VARIANT HERE!!!!!
+  variant_list = "",
+  plot_width = 10.5,
+  plot_height = 5.2,
+  png_dpi = 300L
+)
+# -------------------------------------------------------------------
+
+required_packages <- c("ggplot2", "ggseqlogo", "patchwork", "dplyr", "readr", "stringr", "tibble", "rhdf5")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop("Install missing packages first: ", paste(missing_packages, collapse = ", "), call. = FALSE)
+}
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(ggseqlogo)
+  library(patchwork)
+  library(dplyr)
+  library(readr)
+  library(stringr)
+  library(tibble)
+  library(rhdf5)
+})
+
+base_letters <- c("A", "C", "G", "T")
+base_colors <- c(A = "#2a9d8f", C = "#457b9d", G = "#bc6c25", T = "#c44e52")
+score_files <- c(Control = "Control_averaged.mean.variant_scores.tsv", Treated = "Treated_averaged.mean.variant_scores.tsv")
+model_condition_map <- c(Control = "Resting", Treated = "Stimulated")
+
+read_yaml_config <- function(path) {
+  if (!nzchar(path)) return(list())
+  if (!requireNamespace("yaml", quietly = TRUE)) {
+    stop("Install the yaml R package to use --config.", call. = FALSE)
+  }
+  if (!file.exists(path)) stop("Missing config file: ", path, call. = FALSE)
+  config <- yaml::read_yaml(path)
+  if (is.null(config)) list() else config
+}
+
+list_to_vector <- function(x) {
+  if (is.list(x) && is.null(names(x))) return(unlist(x, use.names = FALSE))
+  x
+}
+
+merge_config <- function(cfg, config) {
+  for (key in intersect(names(config), names(cfg))) {
+    cfg[[key]] <- list_to_vector(config[[key]])
+  }
+  cfg
+}
+
+find_config_arg <- function(args) {
+  eq <- grep("^--config=", args, value = TRUE)
+  if (length(eq) > 0) return(sub("^--config=", "", eq[[1]]))
+
+  idx <- match("--config", args)
+  if (!is.na(idx)) {
+    if (idx == length(args)) stop("--config requires a file path.", call. = FALSE)
+    return(args[[idx + 1L]])
+  }
+
+  ""
+}
+
+drop_config_args <- function(args) {
+  out <- character()
+  skip_next <- FALSE
+  for (arg in args) {
+    if (skip_next) {
+      skip_next <- FALSE
+      next
+    }
+    if (identical(arg, "--config")) {
+      skip_next <- TRUE
+      next
+    }
+    if (startsWith(arg, "--config=")) next
+    out <- c(out, arg)
+  }
+  out
+}
+
+parse_args <- function(cfg) {
+  args <- commandArgs(trailingOnly = TRUE)
+  cfg <- merge_config(cfg, read_yaml_config(find_config_arg(args)))
+  args <- drop_config_args(args)
+
+  if (any(grepl("^--variant(=|-list=)", args))) cfg$variant <- character()
+  for (arg in args) {
+    if (!startsWith(arg, "--")) next
+    pieces <- strsplit(sub("^--", "", arg), "=", fixed = TRUE)[[1]]
+    key <- gsub("-", "_", pieces[1])
+    value <- if (length(pieces) > 1) paste(pieces[-1], collapse = "=") else "TRUE"
+
+    if (key == "variant") {
+      cfg$variant <- c(cfg$variant, trimws(strsplit(value, ",", fixed = TRUE)[[1]]))
+    } else if (key %in% c("left_bp", "right_bp")) {
+      cfg[[key]] <- suppressWarnings(as.integer(value))
+    } else if (key %in% c("plot_width", "plot_height")) {
+      cfg[[key]] <- suppressWarnings(as.numeric(value))
+    } else if (key == "png_dpi") {
+      cfg[[key]] <- suppressWarnings(as.integer(value))
+    } else if (key %in% names(cfg)) {
+      cfg[[key]] <- value
+    }
+  }
+  cfg
+}
+
+safe_name <- function(x) {
+  x <- ifelse(is.na(x) | x == "", "variant", as.character(x))
+  stringr::str_replace_all(x, "[^A-Za-z0-9_.-]+", "_")
+}
+
+short_safe_name <- function(x, max_len = 80L) {
+  x <- safe_name(x)
+  if (nchar(x) <= max_len) return(x)
+  digest <- sprintf("%08x", abs(sum(utf8ToInt(x) * seq_along(utf8ToInt(x))) %% 2^31))
+  paste0(substr(x, 1L, max_len - nchar(digest) - 1L), "_", digest)
+}
+
+hash_suffix <- function(x) {
+  x <- safe_name(x)
+  sprintf("%08x", abs(sum(utf8ToInt(x) * seq_along(utf8ToInt(x))) %% 2^31))
+}
+
+format_num <- function(x, digits = 4) {
+  x <- suppressWarnings(as.numeric(x))
+  ifelse(is.na(x), "NA", formatC(x, digits = digits, format = "fg", flag = "#"))
+}
+
+decode_variant_ids <- function(bytes, n_ids) {
+  bytes <- as.integer(bytes)
+  chunk <- length(bytes) / n_ids
+  if (chunk != floor(chunk)) stop("variant_ids byte vector is not divisible by expected id count.", call. = FALSE)
+  out <- character(n_ids)
+  for (i in seq_len(n_ids)) {
+    start <- (i - 1L) * chunk + 1L
+    vals <- bytes[start:(start + chunk - 1L)]
+    ascii_bytes <- vals[seq(1L, chunk, by = 4L)]
+    ascii_bytes <- ascii_bytes[ascii_bytes != 0L]
+    out[i] <- rawToChar(as.raw(ascii_bytes))
+  }
+  out
+}
+
+read_score_maps <- function(input_dir) {
+  maps <- list()
+  for (state in names(score_files)) {
+    path <- file.path(input_dir, score_files[[state]])
+    if (!file.exists(path)) {
+      nested_path <- file.path(input_dir, paste0(state, "_averaged_variantscores"), score_files[[state]])
+      if (file.exists(nested_path)) path <- nested_path
+    }
+    if (!file.exists(path)) stop("Missing score file for ", state, ": ", file.path(input_dir, score_files[[state]]), call. = FALSE)
+    maps[[state]] <- readr::read_tsv(path, show_col_types = FALSE, progress = FALSE)
+  }
+  maps
+}
+
+read_context_table <- function(path) {
+  if (!nzchar(path) || !file.exists(path)) return(tibble())
+  readr::read_tsv(path, show_col_types = FALSE, progress = FALSE)
+}
+
+load_fold_average <- function(shap_dir, condition_name, head_name) {
+  folder <- file.path(shap_dir, condition_name)
+  files <- list.files(folder, pattern = paste0("\\.variant_shap\\.", head_name, "\\.h5$"), full.names = TRUE)
+  files <- sort(files)
+  if (length(files) == 0) stop("No ", condition_name, " ", head_name, " SHAP files found in ", folder, call. = FALSE)
+
+  variant_ids <- NULL
+  allele0_raw <- NULL
+  allele1_raw <- NULL
+  allele0_proj_sum <- NULL
+  allele1_proj_sum <- NULL
+
+  for (path in files) {
+    raw_arr <- rhdf5::h5read(path, "raw/seq")
+    ids <- decode_variant_ids(rhdf5::h5read(path, "variant_ids"), dim(raw_arr)[3])
+    n <- length(ids) / 2L
+    if (is.null(variant_ids)) {
+      variant_ids <- ids[seq_len(n)]
+      allele0_raw <- raw_arr[, , seq_len(n), drop = FALSE]
+      allele1_raw <- raw_arr[, , n + seq_len(n), drop = FALSE]
+    } else if (!identical(ids[seq_len(n)], variant_ids)) {
+      stop("Variant order differs in ", path, call. = FALSE)
+    }
+
+    proj_arr <- rhdf5::h5read(path, "projected_shap/seq")
+    a0 <- proj_arr[, , seq_len(n), drop = FALSE]
+    a1 <- proj_arr[, , n + seq_len(n), drop = FALSE]
+    allele0_proj_sum <- if (is.null(allele0_proj_sum)) a0 else allele0_proj_sum + a0
+    allele1_proj_sum <- if (is.null(allele1_proj_sum)) a1 else allele1_proj_sum + a1
+  }
+
+  list(
+    variant_ids = variant_ids,
+    variant_index = setNames(seq_along(variant_ids), variant_ids),
+    allele0_raw = allele0_raw,
+    allele1_raw = allele1_raw,
+    allele0_proj = allele0_proj_sum / length(files),
+    allele1_proj = allele1_proj_sum / length(files)
+  )
+}
+
+active_bases <- function(raw_mat) {
+  base_letters[max.col(raw_mat, ties.method = "first")]
+}
+
+active_scores <- function(raw_mat, proj_mat) {
+  idx <- max.col(raw_mat, ties.method = "first")
+  proj_mat[cbind(seq_len(nrow(proj_mat)), idx)]
+}
+
+find_variant_center <- function(raw0, raw1) {
+  diff_pos <- which(rowSums(raw0 != raw1) > 0)
+  if (length(diff_pos) != 1) stop("Expected one variant position, found ", length(diff_pos), call. = FALSE)
+  diff_pos[[1]]
+}
+
+parse_variant_metadata <- function(variant_id) {
+  source <- stringr::str_match(variant_id, "Source:([^_]+)")[, 2]
+  driver <- stringr::str_match(variant_id, "Driver:(rs[^_]+)")[, 2]
+  tested <- stringr::str_match(variant_id, "Tested:(rs[^_]+)")[, 2]
+  qtl <- stringr::str_match(variant_id, "(?:caQTL|haQTL|hQTL|mQTL):(rs[^_]+)")[, 2]
+  gwas <- stringr::str_match(variant_id, "GWAS:(rs[^_]+)")[, 2]
+  run_state <- stringr::str_match(variant_id, "_(Rest|Stim)$")[, 2]
+  condition <- stringr::str_match(variant_id, "Condition:([^_]+)")[, 2]
+  role <- stringr::str_match(variant_id, "Role:(.*?)(?:_Tested:|$)")[, 2]
+  pip <- suppressWarnings(as.numeric(stringr::str_match(variant_id, "PIP:([0-9.eE+-]+)")[, 2]))
+  driver <- dplyr::coalesce(driver, tested, qtl)
+  run_state <- dplyr::coalesce(run_state, condition)
+  tibble(
+    source_modality = ifelse(is.na(source), "", source),
+    role = ifelse(is.na(role), "", role),
+    driver_rsid = ifelse(is.na(driver), "", driver),
+    tested_rsid = ifelse(is.na(tested), "", tested),
+    qtl_rsid = ifelse(is.na(qtl), "", qtl),
+    gwas_rsid = ifelse(is.na(gwas), "", gwas),
+    run_state = ifelse(is.na(run_state), "", run_state),
+    variant_pip = pip
+  )
+}
+
+read_variant_requests <- function(cfg) {
+  requests <- cfg$variant
+  if (nzchar(cfg$variant_list)) {
+    if (!file.exists(cfg$variant_list)) {
+      stop(
+        "Missing variant list file: ", cfg$variant_list,
+        ". For one rsID, set cfg$variant = c('", cfg$variant_list, "') and cfg$variant_list = ''.",
+        call. = FALSE
+      )
+    }
+    ext <- tolower(tools::file_ext(cfg$variant_list))
+    if (ext %in% c("tsv", "csv")) {
+      delim <- ifelse(ext == "tsv", "\t", ",")
+      rows <- readr::read_delim(cfg$variant_list, delim = delim, show_col_types = FALSE, progress = FALSE)
+      for (i in seq_len(nrow(rows))) {
+        for (key in c("variant_id", "driver_rsid", "rsid", "snp_id", "gwas_rsid")) {
+          if (key %in% names(rows) && !is.na(rows[[key]][i]) && nzchar(as.character(rows[[key]][i]))) {
+            value <- as.character(rows[[key]][i])
+            if (key == "snp_id") value <- tail(strsplit(value, ":", fixed = TRUE)[[1]], 1)
+            requests <- c(requests, value)
+            break
+          }
+        }
+      }
+    } else {
+      requests <- c(requests, readLines(cfg$variant_list, warn = FALSE))
+    }
+  }
+  requests[nzchar(requests)]
+}
+
+preflight <- function(cfg) {
+  if (!cfg$head %in% c("counts", "profile")) stop("--head must be counts or profile.", call. = FALSE)
+  if (!dir.exists(cfg$shap_dir)) stop("Missing SHAP directory: ", cfg$shap_dir, call. = FALSE)
+  if (!dir.exists(cfg$input_dir)) stop("Missing score/input directory: ", cfg$input_dir, call. = FALSE)
+  if (nzchar(cfg$context_tsv) && !file.exists(cfg$context_tsv)) stop("Missing context TSV: ", cfg$context_tsv, call. = FALSE)
+  for (state in names(score_files)) {
+    shap_state_dir <- file.path(cfg$shap_dir, state)
+    if (!dir.exists(shap_state_dir)) stop("Missing SHAP state directory: ", shap_state_dir, call. = FALSE)
+    h5_files <- list.files(shap_state_dir, pattern = paste0("\\.variant_shap\\.", cfg$head, "\\.h5$"), full.names = TRUE)
+    if (length(h5_files) == 0) stop("No ", state, " ", cfg$head, " SHAP H5 files found in: ", shap_state_dir, call. = FALSE)
+
+    score_path <- file.path(cfg$input_dir, score_files[[state]])
+    nested_score_path <- file.path(cfg$input_dir, paste0(state, "_averaged_variantscores"), score_files[[state]])
+    if (!file.exists(score_path) && !file.exists(nested_score_path)) {
+      stop("Missing score file for ", state, ": ", score_path, call. = FALSE)
+    }
+  }
+  if (!is.finite(cfg$plot_width) || cfg$plot_width <= 0) stop("plot_width must be positive.", call. = FALSE)
+  if (!is.finite(cfg$plot_height) || cfg$plot_height <= 0) stop("plot_height must be positive.", call. = FALSE)
+  if (is.na(cfg$png_dpi) || cfg$png_dpi < 72) stop("png_dpi must be at least 72.", call. = FALSE)
+  invisible(TRUE)
+}
+
+resolve_variants <- function(available_ids, requests) {
+  meta <- bind_rows(lapply(available_ids, parse_variant_metadata)) %>% mutate(variant_id = available_ids)
+  resolved <- character()
+  missing <- character()
+  for (item in requests) {
+    item <- trimws(item)
+    if (item %in% available_ids) {
+      resolved <- c(resolved, item)
+    } else {
+      hits_df <- meta %>%
+        filter(driver_rsid == item | tested_rsid == item | qtl_rsid == item | gwas_rsid == item)
+      tested_hits <- hits_df %>% filter(role == "tested_driver")
+      if (nrow(tested_hits) > 0) hits_df <- tested_hits
+      hits <- hits_df %>% pull(variant_id)
+      if (length(hits) > 0) resolved <- c(resolved, hits) else missing <- c(missing, item)
+    }
+  }
+  list(resolved = unique(resolved), missing = unique(missing))
+}
+
+context_for_variant <- function(variant_id, context_df) {
+  meta <- parse_variant_metadata(variant_id)
+  empty <- tibble(
+    source_condition = ifelse(nzchar(meta$run_state), meta$run_state, NA_character_),
+    source_pip = NA_real_,
+    source_pip_origin = NA_character_,
+    same_feature_opposite_pip = NA_real_,
+    same_feature_opposite_origin = NA_character_,
+    best_opposite_pip = NA_real_,
+    best_opposite_origin = NA_character_,
+    locus_pph4 = NA_real_,
+    cs_values = NA_character_,
+    story_role = NA_character_
+  )
+  if (nrow(context_df) == 0 || !nzchar(meta$driver_rsid)) return(empty)
+
+  hits <- context_df %>%
+    filter(driver_rsid == meta$driver_rsid)
+  if (nrow(hits) == 0) return(empty)
+
+  if (nzchar(meta$run_state) && "source_condition" %in% names(hits)) {
+    same_state <- hits %>% filter(source_condition == meta$run_state)
+    if (nrow(same_state) > 0) hits <- same_state
+  }
+  if ("variant_id" %in% names(hits)) {
+    same_variant <- hits %>% filter(variant_id == !!variant_id)
+    if (nrow(same_variant) > 0) hits <- same_variant
+  }
+
+  row <- hits %>% slice_head(n = 1)
+  empty$source_condition <- if ("source_condition" %in% names(row)) as.character(row$source_condition[[1]]) else empty$source_condition
+  for (nm in intersect(names(empty), names(row))) {
+    if (nm == "source_condition") next
+    empty[[nm]] <- row[[nm]][[1]]
+  }
+  empty
+}
+
+model_for_run_state <- function(run_state) {
+  if (!nzchar(run_state)) return("Control")
+  if (run_state == "Stim") return("Treated")
+  "Control"
+}
+
+first_numeric <- function(...) {
+  values <- list(...)
+  for (value in values) {
+    if (length(value) == 0) next
+    num <- suppressWarnings(as.numeric(value[[1]]))
+    if (!is.na(num)) return(num)
+  }
+  NA_real_
+}
+
+slice_record <- function(dataset, variant_id, condition, head_name, left_bp, right_bp) {
+  idx <- dataset$variant_index[[variant_id]]
+  raw0 <- dataset$allele0_raw[, , idx]
+  raw1 <- dataset$allele1_raw[, , idx]
+  proj0 <- dataset$allele0_proj[, , idx]
+  proj1 <- dataset$allele1_proj[, , idx]
+  center <- find_variant_center(raw0, raw1)
+  start <- max(1L, center - left_bp)
+  end <- min(nrow(raw0), center + right_bp)
+
+  ref_scores <- active_scores(raw0, proj0)[start:end]
+  alt_scores <- active_scores(raw1, proj1)[start:end]
+  ref_bases <- active_bases(raw0)[start:end]
+  alt_bases <- active_bases(raw1)[start:end]
+  rel_pos <- (start:end) - center
+
+  tibble(
+    variant_id = variant_id,
+    condition = condition,
+    head = head_name,
+    rel_pos = rel_pos,
+    ref_base = ref_bases,
+    alt_base = alt_bases,
+    ref_shap = as.numeric(ref_scores),
+    alt_shap = as.numeric(alt_scores),
+    delta_shap = as.numeric(alt_scores - ref_scores)
+  )
+}
+
+make_shap_logo_matrix <- function(df, allele) {
+  base_col <- paste0(allele, "_base")
+  shap_col <- paste0(allele, "_shap")
+  mat <- matrix(0, nrow = length(base_letters), ncol = nrow(df), dimnames = list(base_letters, NULL))
+  for (i in seq_len(nrow(df))) {
+    base <- df[[base_col]][[i]]
+    value <- df[[shap_col]][[i]]
+    if (base %in% base_letters && is.finite(value)) mat[base, i] <- value
+  }
+  mat
+}
+
+make_seq_logo <- function(df, allele, left_bp, right_bp, title, ylimit) {
+  shap_mat <- make_shap_logo_matrix(df, allele)
+  logo <- suppressWarnings(suppressMessages(
+    ggseqlogo::ggseqlogo(shap_mat, method = "custom", seq_type = "dna")
+  ))
+  suppressWarnings(suppressMessages(logo +
+    annotate("rect", xmin = left_bp + 0.5, xmax = left_bp + 1.5, ymin = -Inf, ymax = Inf, fill = "#e2e8f0", alpha = 0.45) +
+    geom_vline(xintercept = left_bp + 1, linetype = 2, linewidth = 0.35, color = "#64748b") +
+    coord_cartesian(ylim = c(-ylimit, ylimit)) +
+    labs(title = title, x = NULL, y = "counts SHAP") +
+    theme_classic(base_size = 9.5) +
+    theme(
+      plot.title = element_text(face = "bold", size = 10.5),
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank()
+    )
+  ))
+}
+
+make_shap_bar <- function(df, value_col, base_col, title, ylab) {
+  values <- df[[value_col]]
+  ymax <- max(abs(values), na.rm = TRUE) * 1.18
+  if (!is.finite(ymax) || ymax <= 0) ymax <- 2e-4
+  ggplot(df, aes(x = rel_pos, y = .data[[value_col]], fill = .data[[base_col]])) +
+    annotate("rect", xmin = -0.5, xmax = 0.5, ymin = -Inf, ymax = Inf, fill = "#e2e8f0", alpha = 0.6) +
+    geom_hline(yintercept = 0, color = "#94a3b8", linewidth = 0.45) +
+    geom_col(width = 0.82, color = NA) +
+    scale_fill_manual(values = base_colors, drop = FALSE) +
+    scale_x_continuous(breaks = df$rel_pos, expand = expansion(add = 0.7)) +
+    coord_cartesian(ylim = c(-ymax, ymax)) +
+    labs(title = title, x = "bp relative to variant", y = ylab) +
+    theme_classic(base_size = 9.5) +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(face = "bold", size = 10.5),
+      axis.text.x = element_text(size = 7)
+    )
+}
+
+make_delta_bar <- function(df, title) {
+  values <- df$delta_shap
+  ymax <- max(abs(values), na.rm = TRUE) * 1.18
+  if (!is.finite(ymax) || ymax <= 0) ymax <- 2e-4
+  ggplot(df, aes(x = rel_pos, y = delta_shap, fill = delta_shap >= 0)) +
+    annotate("rect", xmin = -0.5, xmax = 0.5, ymin = -Inf, ymax = Inf, fill = "#e2e8f0", alpha = 0.6) +
+    geom_hline(yintercept = 0, color = "#94a3b8", linewidth = 0.45) +
+    geom_col(width = 0.82, color = NA) +
+    scale_fill_manual(values = c(`TRUE` = "#d62828", `FALSE` = "#457b9d")) +
+    scale_x_continuous(breaks = df$rel_pos, expand = expansion(add = 0.7)) +
+    coord_cartesian(ylim = c(-ymax, ymax)) +
+    labs(title = title, x = "bp relative to variant", y = "alt - ref") +
+    theme_classic(base_size = 9.5) +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(face = "bold", size = 10.5),
+      axis.text.x = element_text(size = 7)
+    )
+}
+
+make_condition_panel <- function(df, condition, left_bp, right_bp, head_name, ylimit) {
+  condition_label <- paste0(condition, " (", model_condition_map[[condition]], ")")
+  ref <- make_seq_logo(df, "ref", left_bp, right_bp, paste(condition_label, "ref counts SHAP"), ylimit)
+  alt <- make_seq_logo(df, "alt", left_bp, right_bp, paste(condition_label, "alt counts SHAP"), ylimit)
+  ref | alt
+}
+
+plot_variant <- function(rows, variant_id, cfg, score_maps, context_df) {
+  meta <- parse_variant_metadata(variant_id)
+  context <- context_for_variant(variant_id, context_df)
+  source_model <- model_for_run_state(meta$run_state)
+  source_rows <- rows %>% filter(condition == source_model)
+  source_score <- score_maps[[source_model]] %>% filter(variant_id == !!variant_id) %>% slice_head(n = 1)
+  source_sum <- sum(source_rows$delta_shap)
+  center_row <- rows %>% filter(rel_pos == 0) %>% slice_head(n = 1)
+  allele_change <- if (nrow(center_row) > 0 && center_row$ref_base[[1]] != center_row$alt_base[[1]]) {
+    paste0(center_row$ref_base[[1]], ">", center_row$alt_base[[1]])
+  } else {
+    "ref=alt"
+  }
+  score_row <- source_score
+  genomic_label <- ""
+  if (nrow(score_row) > 0 && all(c("chr", "pos") %in% names(score_row))) {
+    genomic_label <- paste0(score_row$chr[[1]], ":", score_row$pos[[1]])
+  }
+  ylimit <- max(abs(c(source_rows$ref_shap, source_rows$alt_shap)), na.rm = TRUE) * 1.18
+  if (!is.finite(ylimit) || ylimit <= 0) ylimit <- 2e-4
+  tested_label <- ifelse(nzchar(meta$tested_rsid), meta$tested_rsid, ifelse(nzchar(meta$driver_rsid), meta$driver_rsid, "variant"))
+  modality_label <- ifelse(nzchar(meta$source_modality), meta$source_modality, "xQTL")
+  modality_label <- toupper(gsub("qtl$", "QTL", modality_label))
+  source_pip <- first_numeric(meta$variant_pip, context$source_pip)
+  source_pip_label <- ifelse(!is.na(source_pip), paste0("tested variant PIP ", format_num(source_pip, digits = 3)), "tested variant PIP NA")
+  pph4_label <- ifelse(!is.na(context$locus_pph4[[1]]), paste0("PP.H4 ", format_num(context$locus_pph4[[1]], digits = 3)), "PP.H4 NA")
+  tested_title <- paste0("Tested ", tested_label, " ", allele_change)
+  if (nzchar(genomic_label)) tested_title <- paste0(tested_title, " (", genomic_label, ")")
+  title_parts <- c(
+    tested_title,
+    modality_label,
+    ifelse(nzchar(meta$gwas_rsid), paste0("GWAS ", meta$gwas_rsid), NA_character_),
+    ifelse(nzchar(meta$qtl_rsid), paste0("xQTL ", meta$qtl_rsid), NA_character_),
+    ifelse(nzchar(meta$run_state), meta$run_state, NA_character_)
+  )
+  plot_title <- paste(title_parts[!is.na(title_parts)], collapse = " | ")
+  if (!nzchar(plot_title)) plot_title <- variant_id
+
+  subtitle <- sprintf("window -%s..+%s nt | %s | %s", cfg$left_bp, cfg$right_bp, source_pip_label, pph4_label)
+
+  panel <- make_condition_panel(source_rows, source_model, cfg$left_bp, cfg$right_bp, cfg$head, ylimit) +
+    plot_annotation(
+      title = plot_title,
+      subtitle = subtitle,
+      theme = theme(
+        plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+        plot.subtitle = element_text(size = 9.5, color = "#475569", hjust = 0.5)
+      )
+    )
+
+  dir.create(cfg$out_dir, recursive = TRUE, showWarnings = FALSE)
+  if (!dir.exists(cfg$out_dir)) {
+    stop("Could not create output directory: ", cfg$out_dir, call. = FALSE)
+  }
+  stem <- short_safe_name(paste(
+    c(tested_label, allele_change, genomic_label, paste0("GWAS_", meta$gwas_rsid), paste0("xQTL_", meta$qtl_rsid), meta$run_state, cfg$head, hash_suffix(variant_id)),
+    collapse = "_"
+  ))
+  png_path <- file.path(cfg$out_dir, paste0(stem, ".png"))
+  pdf_path <- file.path(cfg$out_dir, paste0(stem, ".pdf"))
+  suppressWarnings(suppressMessages(
+    ggsave(png_path, panel, width = cfg$plot_width, height = cfg$plot_height, dpi = cfg$png_dpi, device = "png", bg = "white", limitsize = FALSE)
+  ))
+  suppressWarnings(suppressMessages(
+    ggsave(pdf_path, panel, width = cfg$plot_width, height = cfg$plot_height, device = "pdf", bg = "white", limitsize = FALSE)
+  ))
+  c(png = png_path, pdf = pdf_path, source_model = source_model, source_delta_sum = source_sum, source_pip = source_pip)
+}
+
+main <- function() {
+  cfg <<- parse_args(cfg)
+  preflight(cfg)
+  requests <- read_variant_requests(cfg)
+  if (length(requests) == 0) stop("Provide --variant=rsID_or_variant_id or --variant-list=path.", call. = FALSE)
+
+  datasets <- list(
+    Control = load_fold_average(cfg$shap_dir, "Control", cfg$head),
+    Treated = load_fold_average(cfg$shap_dir, "Treated", cfg$head)
+  )
+  resolved <- resolve_variants(datasets$Control$variant_ids, requests)
+  if (length(resolved$resolved) == 0) {
+    stop("No requested variants were found in local SHAP reruns: ", paste(resolved$missing, collapse = ", "), call. = FALSE)
+  }
+
+  score_maps <- read_score_maps(cfg$input_dir)
+  context_df <- read_context_table(cfg$context_tsv)
+  all_values <- list()
+  manifest <- list()
+  for (variant_id in resolved$resolved) {
+    meta <- parse_variant_metadata(variant_id)
+    source_model <- model_for_run_state(meta$run_state)
+    rows <- slice_record(datasets[[source_model]], variant_id, source_model, cfg$head, cfg$left_bp, cfg$right_bp)
+    paths <- plot_variant(rows, variant_id, cfg, score_maps, context_df)
+    context <- context_for_variant(variant_id, context_df)
+    source_sum <- rows %>% summarise(x = sum(delta_shap), .groups = "drop") %>% pull(x)
+    all_values[[length(all_values) + 1L]] <- rows
+    manifest[[length(manifest) + 1L]] <- bind_cols(
+      tibble(variant_id = variant_id),
+      meta,
+      context,
+      tibble(
+        head = cfg$head,
+        source_model = source_model,
+        source_model_condition = model_condition_map[[source_model]],
+        plotted_rel_pos_min = min(rows$rel_pos),
+        plotted_rel_pos_max = max(rows$rel_pos),
+        left_bp = cfg$left_bp,
+        right_bp = cfg$right_bp,
+        source_delta_sum = source_sum,
+        plotted_source_pip = suppressWarnings(as.numeric(paths[["source_pip"]])),
+        png = paths[["png"]],
+        pdf = paths[["pdf"]]
+      )
+    )
+  }
+
+  prefix <- if (length(resolved$resolved) == 1L) short_safe_name(resolved$resolved[[1]]) else "variant_motif_shap_plots"
+  values_path <- file.path(cfg$out_dir, paste0(prefix, "_", cfg$head, "_values.tsv"))
+  manifest_path <- file.path(cfg$out_dir, paste0(prefix, "_", cfg$head, "_manifest.tsv"))
+  readr::write_tsv(bind_rows(all_values), values_path)
+  manifest_df <- bind_rows(manifest)
+  readr::write_tsv(manifest_df, manifest_path)
+
+  check_path <- file.path(cfg$out_dir, paste0(prefix, "_", cfg$head, "_plot_check.tsv"))
+  readr::write_tsv(
+    manifest_df %>%
+      transmute(
+        variant_id,
+        driver_rsid,
+        gwas_rsid,
+        source_modality,
+        xqtl_run_state = run_state,
+        source_model,
+        source_model_condition,
+        source_pip,
+        source_pip_origin,
+        same_feature_opposite_pip,
+        same_feature_opposite_origin,
+        best_opposite_pip,
+        best_opposite_origin,
+        source_delta_sum,
+        plotted_rel_pos_min,
+        plotted_rel_pos_max,
+        png,
+        pdf
+      ),
+    check_path
+  )
+
+  message("Wrote ", length(manifest), " variant plot(s) to: ", cfg$out_dir)
+  message("Wrote plotted values: ", values_path)
+  message("Wrote manifest: ", manifest_path)
+  message("Wrote plot check: ", check_path)
+  if (length(resolved$missing) > 0) message("Requested but missing from local SHAP reruns: ", paste(resolved$missing, collapse = ", "))
+}
+
+main()
+
