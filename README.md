@@ -1,7 +1,9 @@
 ChromBPNet Variant-Effect Prediction Pipeline
 
 
-<img width="800" height="600" alt="synthetic_shap_logo_1" src="https://github.com/user-attachments/assets/42f069a3-eea8-4e5e-b6c9-1338a48b8929" 
+
+<img width="800" height="600" alt="synthetic_shap_logo_1" src="https://github.com/user-attachments/assets/0534a396-3978-452d-8c24-622f88e3af2f" />
+
 *Example Output plot after running "VEP_Scorer.sh" and "Motifplot.R"
 
 A SLURM-ready Bash pipeline that scores genetic variants with ChromBPNet models,
