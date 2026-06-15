@@ -1,5 +1,10 @@
 ChromBPNet Variant-Effect Prediction Pipeline
 
+
+<img width="1282" height="1079" alt="synthetic_shap_logo_1" src="https://github.com/user-attachments/assets/42f069a3-eea8-4e5e-b6c9-1338a48b8929" />
+Synthetic Example Output Plot from Variant Effect Scorer
+
+
 A SLURM-ready Bash pipeline that scores genetic variants with ChromBPNet models,
 averages their effects across cross-validation folds, annotates them with peaks,
 nearest genes, and motif hits, and optionally computes per-variant SHAP scores.
